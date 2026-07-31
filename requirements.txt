@@ -1,0 +1,21 @@
+# Front-end / App
+streamlit>=1.35
+
+# Visualização de dados
+plotly>=5.22
+
+# Manipulação de dados
+pandas>=2.2,<3.0
+numpy>=1.26
+
+# Integração de dados de mercado
+python-bcb>=0.3        # séries agregadas do BCB/SGS (Selic, CDI, IPCA) - uso complementar
+yfinance>=0.2.40        # cotações dos ETFs de Renda Fixa
+requests>=2.32           # download do CSV oficial do Tesouro Transparente
+
+# LLM
+google-genai>=1.0
+
+# Configuração de ambiente
+python-dotenv>=1.0
+truststore>=0.9  # usa o repositório de certificados do SO (necessário atrás de proxy/antivírus com inspeção SSL)
