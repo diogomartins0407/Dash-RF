@@ -37,8 +37,11 @@ TICKERS_ETF_RF = {
 
 
 def get_data_referencia() -> date:
-    """Data de referência fixa do projeto: hoje menos um mês."""
-    return date.today() - relativedelta(months=1)
+    """Data de referência do projeto: hoje. `_data_disponivel_mais_proxima` já cai para o
+    último dia útil com dado publicado, então isso sempre resolve para o dado mais recente
+    disponível (nunca um alvo futuro sem dado).
+    """
+    return date.today()
 
 
 def _data_disponivel_mais_proxima(datas_disponiveis: pd.Series, data_alvo: date) -> pd.Timestamp:

@@ -2,6 +2,7 @@
 
 import os
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -11,6 +12,7 @@ from google import genai
 from data_fetch import (
     get_cotacoes_etfs,
     get_curva_prefixada,
+    get_data_referencia,
     get_series_bcb,
     get_titulos_ipca,
     get_titulos_selic,
@@ -116,6 +118,16 @@ ATIVOS_VALOR_FUTURO = {
     "NCDI11": {"categoria": "etf", "ticker": "NCDI11"},
 }
 
+TIPOS_TITULO_MARCACAO = {
+    "Tesouro Prefixado": "prefixado",
+    "Tesouro IPCA+": "ipca",
+    "Tesouro Selic": "selic",
+}
+
+DELTA_CENARIO_OTIMISTA_PP = -1.5
+DELTA_CENARIO_ESTRESSE_PP = 1.5
+DELTA_TAXA_MAXIMO_PP = 3.0
+
 TAXA_PADRAO_FALLBACK = 0.10
 TAXA_INFLACAO_APORTES = 0.045
 TAXA_REINVESTIMENTO_PADRAO_PCT = 8.5
@@ -140,6 +152,10 @@ CHAVE_TAXA_REINVESTIMENTO = "valor_futuro_taxa_reinvestimento"
 CHAVE_TABELA_EVENTOS_EDITOR = "valor_futuro_tabela_eventos_editor"
 CHAVE_VALORES_REAIS = "valor_futuro_valores_reais"
 CHAVE_CONTADOR_RESET = "valor_futuro_reset_contador"
+
+CHAVE_MM_TIPO_TITULO = "marcacao_tipo_titulo"
+CHAVE_MM_VENCIMENTO = "marcacao_vencimento"
+CHAVE_MM_DELTA_TAXA = "marcacao_delta_taxa"
 
 MODELO_GEMINI = "gemini-flash-latest"
 
@@ -245,6 +261,93 @@ def obter_taxa_anual_bruta(ativo_nome: str, prazo_anos: float) -> tuple[float, s
     precos = get_cotacoes_etfs()[info["ticker"]]
     taxa = _retorno_anualizado_etf(precos)
     return taxa, "Retorno anualizado com base no histórico recente de cotações do ETF."
+
+
+def obter_titulos_zero_cupom(categoria: str) -> pd.DataFrame:
+    """Retorna só os títulos sem cupom (LTN / NTN-B Principal), que permitem
+    reprecificação exata de PU sem modelar fluxo de cupons semestrais.
+    """
+    if categoria == "prefixado":
+        curva = get_curva_prefixada()
+        return curva[curva["tipo_titulo"] == "Tesouro Prefixado"].reset_index(drop=True)
+    curva = get_titulos_ipca()
+    return curva[curva["tipo_titulo"] == "Tesouro IPCA+"].reset_index(drop=True)
+
+
+def calcular_du_uteis(data_vencimento: pd.Timestamp) -> int:
+    """Dias úteis entre a data de referência dos dados e o vencimento (fins de semana
+    apenas; feriados não são considerados, simplificação evidenciada na interface).
+    """
+    return int(np.busday_count(get_data_referencia(), data_vencimento.date()))
+
+
+def calcular_duration_anos(du_uteis: int) -> float:
+    """Duration de Macaulay de um título sem cupom: coincide com o prazo até o vencimento."""
+    return du_uteis / DIAS_UTEIS_ANO
+
+
+def simular_pu_estressado(
+    pu_atual: float, taxa_atual_pct: float, delta_taxa_pp: float, du_uteis: int
+) -> tuple[float, float]:
+    """Reprecifica um título sem cupom sob uma nova taxa, a partir do PU e da taxa atuais.
+
+    Exato para título sem cupom: PU = VN_ou_VNA / (1+taxa)^(du/252), então
+    PU_novo / PU_atual = [(1+taxa_atual)/(1+taxa_nova)]^(du/252), sem precisar
+    conhecer VN/VNA explicitamente.
+    """
+    taxa_atual = taxa_atual_pct / 100
+    taxa_nova_pct = taxa_atual_pct + delta_taxa_pp
+    taxa_nova = taxa_nova_pct / 100
+    pu_novo = pu_atual * ((1 + taxa_atual) / (1 + taxa_nova)) ** (du_uteis / DIAS_UTEIS_ANO)
+    return pu_novo, taxa_nova_pct
+
+
+def montar_tabela_sensibilidade(titulos: pd.DataFrame, delta_taxa_pp: float) -> pd.DataFrame:
+    """Aplica o mesmo choque de taxa (paralelo) a todos os vencimentos de um tipo de título,
+    para comparar qual deles reage mais ao cenário — quanto maior a duration, maior o efeito.
+    """
+    linhas = []
+    for linha in titulos.itertuples():
+        du_uteis = calcular_du_uteis(linha.data_vencimento)
+        duration_anos = calcular_duration_anos(du_uteis)
+        pu_atual = float(linha.pu_compra)
+        taxa_atual_pct = float(linha.taxa_compra)
+        pu_novo, taxa_nova_pct = simular_pu_estressado(pu_atual, taxa_atual_pct, delta_taxa_pp, du_uteis)
+        linhas.append(
+            {
+                "Vencimento": linha.data_vencimento.strftime("%d/%m/%Y"),
+                "Duration (anos)": duration_anos,
+                "Taxa Atual (% a.a.)": taxa_atual_pct,
+                "PU Atual (R$)": pu_atual,
+                "Taxa Simulada (% a.a.)": taxa_nova_pct,
+                "PU Simulado (R$)": pu_novo,
+                "Ágio/Deságio (%)": (pu_novo / pu_atual - 1) * 100,
+            }
+        )
+    return pd.DataFrame(linhas).sort_values("Ágio/Deságio (%)", ascending=False).reset_index(drop=True)
+
+
+def montar_prompt_analise_marcacao(resultados: dict) -> str:
+    return (
+        "Você é um analista financeiro. Explique o resultado de uma simulação de "
+        "marcação a mercado de um título de renda fixa para um investidor leigo, "
+        "em no máximo 150 palavras, em português do Brasil. O investidor está "
+        f"avaliando vender o título antes do vencimento ({resultados['prazo_restante_anos']:.1f} "
+        f"anos restantes, duration de {resultados['duration_anos']:.1f} anos) sob um cenário em que "
+        f"a taxa de juros do título {'sobe' if resultados['delta_taxa_pp'] > 0 else 'cai'} "
+        f"{abs(resultados['delta_taxa_pp']):.2f} pontos percentuais, de "
+        f"{resultados['taxa_atual_pct']:.2f}% para {resultados['taxa_nova_pct']:.2f}% a.a. "
+        "Explique de forma simples por que o preço se move na direção oposta à taxa "
+        "(quanto maior a duration, maior o efeito), e deixe claro que esse "
+        "ágio/deságio só afeta quem vende antes do vencimento — quem carrega o "
+        "título até o fim recebe a taxa contratada, independentemente do que "
+        "aconteceu no meio do caminho. Não utilize emojis em nenhuma parte da "
+        "resposta.\n\n"
+        f"PU Atual: {formatar_moeda(resultados['pu_atual'])}\n"
+        f"PU Simulado: {formatar_moeda(resultados['pu_novo'])}\n"
+        f"Ágio/Deságio: {formatar_moeda(resultados['pu_novo'] - resultados['pu_atual'])} "
+        f"({resultados['variacao_pct']:+.2f}%)\n"
+    )
 
 
 def _preparar_eventos(eventos_df: pd.DataFrame | None, prazo_anos: int) -> pd.DataFrame:
@@ -413,8 +516,8 @@ def montar_prompt_analise(resultados: dict) -> str:
     )
 
 
-def gerar_analise_ia(resultados: dict) -> str:
-    """Chama o Gemini para gerar uma análise textual curta do resultado da simulação."""
+def gerar_analise_ia(prompt: str) -> str:
+    """Chama o Gemini para gerar uma análise textual curta a partir de um prompt já pronto."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY não configurada no .env.")
@@ -422,7 +525,7 @@ def gerar_analise_ia(resultados: dict) -> str:
     cliente = genai.Client(api_key=api_key)
     resposta = cliente.models.generate_content(
         model=MODELO_GEMINI,
-        contents=montar_prompt_analise(resultados),
+        contents=prompt,
     )
     return resposta.text
 
@@ -710,7 +813,225 @@ def renderizar_valor_futuro() -> None:
         }
         with st.spinner("Consultando o Gemini..."):
             try:
-                texto_analise = gerar_analise_ia(resultados)
+                texto_analise = gerar_analise_ia(montar_prompt_analise(resultados))
+                st.info(texto_analise.replace("$", "\\$"), icon=None)
+            except Exception as exc:
+                st.error(f"Não foi possível gerar a análise agora: {exc}")
+
+
+def renderizar_grafico_sensibilidade_pu(
+    pu_atual: float, taxa_atual_pct: float, du_uteis: int, delta_taxa_pp: float
+) -> go.Figure:
+    deltas = np.linspace(-DELTA_TAXA_MAXIMO_PP, DELTA_TAXA_MAXIMO_PP, 61)
+    pus_simulados = [
+        simular_pu_estressado(pu_atual, taxa_atual_pct, float(delta), du_uteis)[0] for delta in deltas
+    ]
+    pu_cenario, _ = simular_pu_estressado(pu_atual, taxa_atual_pct, delta_taxa_pp, du_uteis)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=deltas,
+            y=pus_simulados,
+            name="PU simulado",
+            mode="lines",
+            line=dict(width=2.5, color="#173451"),
+            hovertemplate="Δ taxa: %{x:.2f} p.p.<br>PU: R$ %{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[0],
+            y=[pu_atual],
+            name="PU Atual",
+            mode="markers",
+            marker=dict(size=11, color="#8AA0B9"),
+            hovertemplate="PU Atual: R$ %{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[delta_taxa_pp],
+            y=[pu_cenario],
+            name="Cenário Simulado",
+            mode="markers",
+            marker=dict(size=13, color="#F19828", symbol="diamond"),
+            hovertemplate="Cenário: Δ %{x:.2f} p.p.<br>PU: R$ %{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        font=dict(family="Inter, sans-serif", color="#2D3748"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0),
+        margin=dict(l=10, r=10, t=70, b=10),
+        hovermode="closest",
+        xaxis=dict(title="Ajuste na taxa (pontos percentuais)", showgrid=False, zeroline=True, zerolinecolor="#DDE3EA"),
+        yaxis=dict(title="PU (R$)", showgrid=True, gridcolor="#E2E8F0", zeroline=False, tickprefix="R$ "),
+    )
+    return fig
+
+
+def renderizar_marcacao_mercado() -> None:
+    st.header(PAGINAS["Marcação a Mercado"]["titulo"])
+    st.write(PAGINAS["Marcação a Mercado"]["descricao"])
+
+    sufixo_reset = st.session_state.get(CHAVE_CONTADOR_RESET, 0)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        tipo_titulo_nome = st.selectbox(
+            "Tipo de Título",
+            list(TIPOS_TITULO_MARCACAO.keys()),
+            key=f"{CHAVE_MM_TIPO_TITULO}_{sufixo_reset}",
+        )
+    categoria = TIPOS_TITULO_MARCACAO[tipo_titulo_nome]
+
+    if categoria == "selic":
+        titulos_selic = get_titulos_selic()
+        with col2:
+            if not titulos_selic.empty:
+                st.caption(
+                    f"Spread de compra vigente: {float(titulos_selic['taxa_compra'].iloc[0]):.2f}% "
+                    "sobre a Selic."
+                )
+        st.info(
+            "O Tesouro Selic (LFT) tem seu rendimento atrelado à Selic diariamente, então seu "
+            "preço acompanha o valor justo quase todo dia — a marcação a mercado praticamente "
+            "não gera ágio ou deságio relevante neste título, mesmo em cenários de estresse na "
+            "curva de juros. É por isso que ele costuma ser o mais indicado para reserva de "
+            "emergência: baixo risco de perda se você precisar vender antes do vencimento."
+        )
+        return
+
+    titulos = obter_titulos_zero_cupom(categoria)
+    if titulos.empty:
+        st.warning("Não há títulos sem cupom disponíveis para este tipo no momento.")
+        return
+
+    opcoes_rotulos = [
+        f"{linha.data_vencimento.strftime('%d/%m/%Y')} — taxa atual: {linha.taxa_compra:.2f}% a.a."
+        for linha in titulos.itertuples()
+    ]
+    with col2:
+        indice_escolhido = st.selectbox(
+            "Vencimento",
+            range(len(opcoes_rotulos)),
+            format_func=lambda i: opcoes_rotulos[i],
+            key=f"{CHAVE_MM_VENCIMENTO}_{sufixo_reset}_{categoria}",
+        )
+
+    titulo_escolhido = titulos.iloc[indice_escolhido]
+    pu_atual = float(titulo_escolhido["pu_compra"])
+    taxa_atual_pct = float(titulo_escolhido["taxa_compra"])
+    du_uteis = calcular_du_uteis(titulo_escolhido["data_vencimento"])
+    duration_anos = calcular_duration_anos(du_uteis)
+
+    st.caption(
+        f"Faltam {duration_anos:.1f} anos até o vencimento. Como este título não paga cupom, "
+        f"a duration (sensibilidade do preço a mudanças na taxa) é igual ao prazo: "
+        f"{duration_anos:.1f} anos — quanto maior, maior o efeito de qualquer variação na taxa "
+        "sobre o preço. Considera apenas dias úteis, sem contar feriados."
+    )
+
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("Cenário Otimista: taxa cai", use_container_width=True):
+            st.session_state[f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}"] = DELTA_CENARIO_OTIMISTA_PP
+    with col_btn2:
+        if st.button("Cenário de Estresse: taxa sobe", use_container_width=True):
+            st.session_state[f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}"] = DELTA_CENARIO_ESTRESSE_PP
+
+    delta_taxa_pp = st.slider(
+        "Ajuste na taxa deste título (pontos percentuais)",
+        min_value=-DELTA_TAXA_MAXIMO_PP,
+        max_value=DELTA_TAXA_MAXIMO_PP,
+        value=0.0,
+        step=0.1,
+        key=f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}",
+    )
+
+    if delta_taxa_pp > 0:
+        st.caption(
+            f"Se a taxa deste título subir {delta_taxa_pp:.2f} pontos percentuais, o preço cai "
+            "(deságio) — quem vender antes do vencimento recebe menos do que o valor aplicado "
+            "corrigido pela taxa contratada."
+        )
+    elif delta_taxa_pp < 0:
+        st.caption(
+            f"Se a taxa deste título cair {abs(delta_taxa_pp):.2f} pontos percentuais, o preço "
+            "sobe (ágio) — quem vender antes do vencimento recebe mais do que o valor aplicado "
+            "corrigido pela taxa contratada."
+        )
+    else:
+        st.caption("Ajuste a taxa acima (ou use os botões de cenário) para simular uma venda antecipada.")
+
+    pu_novo, taxa_nova_pct = simular_pu_estressado(pu_atual, taxa_atual_pct, delta_taxa_pp, du_uteis)
+    variacao_pct = (pu_novo / pu_atual - 1) * 100
+    diferenca_pu = pu_novo - pu_atual
+    sinal_diferenca = "+" if diferenca_pu >= 0 else "-"
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("PU Atual", formatar_moeda(pu_atual))
+    col_b.metric("Taxa Simulada", f"{taxa_nova_pct:.2f}% a.a.")
+    col_c.metric(
+        "PU Simulado",
+        formatar_moeda(pu_novo),
+        delta=f"{sinal_diferenca}{formatar_moeda(abs(diferenca_pu))}",
+    )
+    col_d.metric("Ágio/Deságio", f"{variacao_pct:+.2f}%")
+
+    st.plotly_chart(
+        renderizar_grafico_sensibilidade_pu(pu_atual, taxa_atual_pct, du_uteis, delta_taxa_pp),
+        use_container_width=True,
+    )
+
+    st.subheader("Comparativo entre vencimentos")
+    st.caption(
+        f"Todos os vencimentos de {tipo_titulo_nome} sob o mesmo cenário simulado acima "
+        f"({delta_taxa_pp:+.2f} p.p.), ordenados do maior para o menor ágio/deságio — "
+        "útil para comparar em qual vencimento vale mais a pena comprar se a aposta é ganhar "
+        "com a marcação a mercado."
+    )
+    st.dataframe(
+        montar_tabela_sensibilidade(titulos, delta_taxa_pp),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Duration (anos)": st.column_config.NumberColumn(format="%.1f"),
+            "Taxa Atual (% a.a.)": st.column_config.NumberColumn(format="%.2f%%"),
+            "PU Atual (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
+            "Taxa Simulada (% a.a.)": st.column_config.NumberColumn(format="%.2f%%"),
+            "PU Simulado (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
+            "Ágio/Deságio (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+
+    with st.expander("Como funciona a marcação a mercado?"):
+        st.write(
+            "O preço (PU) de um título prefixado ou IPCA+ sem cupom é o valor de face trazido "
+            "a valor presente pela taxa de juros vigente. Se a taxa de mercado sobe depois que "
+            "você comprou, o mesmo título passa a valer menos hoje (deságio); se cai, passa a "
+            "valer mais (ágio). Isso só importa para quem vende antes do vencimento — quem "
+            "carrega o título até o final recebe exatamente a taxa que contratou na compra, "
+            "independentemente do que aconteceu no meio do caminho."
+        )
+
+    st.divider()
+    if st.button("Gerar Análise com IA", key=f"marcacao_btn_ia_{sufixo_reset}"):
+        resultados = {
+            "pu_atual": pu_atual,
+            "pu_novo": pu_novo,
+            "variacao_pct": variacao_pct,
+            "taxa_atual_pct": taxa_atual_pct,
+            "taxa_nova_pct": taxa_nova_pct,
+            "delta_taxa_pp": delta_taxa_pp,
+            "duration_anos": duration_anos,
+            "prazo_restante_anos": duration_anos,
+        }
+        with st.spinner("Consultando o Gemini..."):
+            try:
+                texto_analise = gerar_analise_ia(montar_prompt_analise_marcacao(resultados))
                 st.info(texto_analise.replace("$", "\\$"), icon=None)
             except Exception as exc:
                 st.error(f"Não foi possível gerar a análise agora: {exc}")
@@ -730,6 +1051,8 @@ with st.sidebar:
 
 if pagina_selecionada == "Valor Futuro":
     renderizar_valor_futuro()
+elif pagina_selecionada == "Marcação a Mercado":
+    renderizar_marcacao_mercado()
 else:
     pagina = PAGINAS[pagina_selecionada]
     st.header(pagina["titulo"])
