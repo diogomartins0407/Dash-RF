@@ -119,6 +119,10 @@ ATIVOS_VALOR_FUTURO = {
 TAXA_PADRAO_FALLBACK = 0.10
 TAXA_INFLACAO_APORTES = 0.045
 TAXA_REINVESTIMENTO_PADRAO_PCT = 8.5
+TAXA_POUPANCA_MENSAL_REGRA_ALTA = 0.005
+LIMIAR_SELIC_POUPANCA_PCT = 8.5
+PERCENTUAL_POUPANCA_SOBRE_SELIC = 0.7
+DIAS_UTEIS_ANO = 252
 PRAZO_MAXIMO_ANOS = 30
 
 TIPO_EVENTO_APORTE_EXTRA = "Aporte Extra Único"
@@ -134,6 +138,7 @@ CHAVE_ATIVO = "valor_futuro_ativo"
 CHAVE_REAJUSTE_INFLACAO = "valor_futuro_reajuste_inflacao"
 CHAVE_TAXA_REINVESTIMENTO = "valor_futuro_taxa_reinvestimento"
 CHAVE_TABELA_EVENTOS_EDITOR = "valor_futuro_tabela_eventos_editor"
+CHAVE_VALORES_REAIS = "valor_futuro_valores_reais"
 CHAVE_CONTADOR_RESET = "valor_futuro_reset_contador"
 
 MODELO_GEMINI = "gemini-flash-latest"
@@ -165,6 +170,58 @@ def _retorno_anualizado_etf(precos: pd.Series) -> float:
     return (1 + retorno_total) ** (365 / dias) - 1
 
 
+def obter_selic_cdi_atuais() -> tuple[float, float]:
+    """Retorna (selic_pct, cdi_pct) anuais vigentes a partir da série mais recente do BCB.
+
+    As séries 11 e 12 do SGS trazem a taxa diária (% ao dia); anualiza-se pelo
+    padrão de mercado de 252 dias úteis.
+    """
+    series = get_series_bcb()
+    selic_diaria_pct = float(series["selic"].dropna().iloc[-1])
+    cdi_diaria_pct = float(series["cdi"].dropna().iloc[-1])
+    selic_pct = ((1 + selic_diaria_pct / 100) ** DIAS_UTEIS_ANO - 1) * 100
+    cdi_pct = ((1 + cdi_diaria_pct / 100) ** DIAS_UTEIS_ANO - 1) * 100
+    return selic_pct, cdi_pct
+
+
+def calcular_taxa_poupanca_mensal(selic_anual_pct: float) -> float:
+    """Regra oficial da poupança pós-2012: 0,5% a.m. se a Selic estiver acima de 8,5% a.a.,
+    senão 70% da Selic a.a. convertidos a taxa mensal. A TR é assumida como zero (valor
+    residual nos últimos anos), simplificação evidenciada na interface.
+    """
+    if selic_anual_pct > LIMIAR_SELIC_POUPANCA_PCT:
+        return TAXA_POUPANCA_MENSAL_REGRA_ALTA
+    return (1 + PERCENTUAL_POUPANCA_SOBRE_SELIC * (selic_anual_pct / 100)) ** (1 / 12) - 1
+
+
+def obter_inflacao_implicita(prazo_anos: float) -> tuple[float, str]:
+    """Inflação implícita de mercado via equação de Fisher, comparando o Tesouro Prefixado
+    com o Tesouro IPCA+ de prazo mais próximo ao simulado (Seção 5 do CLAUDE.md).
+    """
+    taxa_pre_pct = _taxa_titulo_mais_proximo(get_curva_prefixada(), prazo_anos)
+    taxa_real_pct = _taxa_titulo_mais_proximo(get_titulos_ipca(), prazo_anos)
+    inflacao_implicita = (1 + taxa_pre_pct / 100) / (1 + taxa_real_pct / 100) - 1
+    metodologia = (
+        "Inflação Implícita = (1 + Taxa Prefixada) / (1 + Taxa Real IPCA+) - 1 = "
+        f"(1 + {taxa_pre_pct:.2f}%) / (1 + {taxa_real_pct:.2f}%) - 1 = "
+        f"{inflacao_implicita * 100:.2f}% a.a., com base nos títulos de prazo mais "
+        "próximo ao prazo simulado."
+    )
+    return inflacao_implicita, metodologia
+
+
+def converter_para_valores_reais(df: pd.DataFrame, inflacao_anual: float) -> pd.DataFrame:
+    """Deflaciona as colunas monetárias mês a mês, trazendo tudo a poder de compra de hoje."""
+    colunas_monetarias = [
+        "saldo_inicial", "saldo_novos_aportes", "saldo_poupanca",
+        "capital_investido", "saldo_bruto", "juros_acumulados",
+    ]
+    fator = (1 + inflacao_anual) ** (df["mes"] / 12)
+    df_real = df.copy()
+    df_real[colunas_monetarias] = df_real[colunas_monetarias].div(fator, axis=0)
+    return df_real
+
+
 def obter_taxa_anual_bruta(ativo_nome: str, prazo_anos: float) -> tuple[float, str]:
     """Busca a taxa anual bruta do ativo escolhido a partir do data_fetch.py."""
     info = ATIVOS_VALOR_FUTURO[ativo_nome]
@@ -182,7 +239,7 @@ def obter_taxa_anual_bruta(ativo_nome: str, prazo_anos: float) -> tuple[float, s
         if titulos_selic.empty:
             raise ValueError("Sem títulos Tesouro Selic disponíveis.")
         spread_pct = float(titulos_selic["taxa_compra"].iloc[0])
-        selic_pct = float(get_series_bcb()["selic"].dropna().iloc[-1])
+        selic_pct, _ = obter_selic_cdi_atuais()
         return (selic_pct + spread_pct) / 100, "Selic vigente ajustada pelo spread de compra do Tesouro Selic."
 
     precos = get_cotacoes_etfs()[info["ticker"]]
@@ -212,6 +269,7 @@ def simular_valor_futuro(
     taxa_anual: float,
     taxa_reinvestimento_anual: float,
     prazo_anos: int,
+    taxa_poupanca_mensal: float,
     eventos_df: pd.DataFrame | None = None,
     reajustar_inflacao: bool = False,
 ) -> tuple[pd.DataFrame, list[dict]]:
@@ -222,7 +280,9 @@ def simular_valor_futuro(
     escolhido (`taxa_anual`), enquanto todo dinheiro novo (aporte mensal
     recorrente, aportes extras e alterações de aporte da tabela de eventos)
     rende à taxa de reinvestimento informada pelo usuário. Também suporta o
-    reajuste anual dos aportes pela inflação.
+    reajuste anual dos aportes pela inflação. Em paralelo, calcula uma terceira
+    linha de referência (`saldo_poupanca`) recebendo os mesmos aportes a uma
+    taxa fixa conservadora, apenas para contraste visual no gráfico.
     """
     meses = prazo_anos * 12
     taxa_mensal_inicial = (1 + taxa_anual) ** (1 / 12) - 1
@@ -231,6 +291,7 @@ def simular_valor_futuro(
 
     saldo_inicial = aporte_inicial
     saldo_novos_aportes = 0.0
+    saldo_poupanca = aporte_inicial
     capital_investido = aporte_inicial
     aporte_mensal_atual = aporte_mensal
 
@@ -240,6 +301,7 @@ def simular_valor_futuro(
             "mes": 0,
             "saldo_inicial": saldo_inicial,
             "saldo_novos_aportes": saldo_novos_aportes,
+            "saldo_poupanca": saldo_poupanca,
             "capital_investido": capital_investido,
             "saldo_bruto": saldo_inicial + saldo_novos_aportes,
         }
@@ -248,6 +310,7 @@ def simular_valor_futuro(
     for mes in range(1, meses + 1):
         saldo_inicial *= 1 + taxa_mensal_inicial
         saldo_novos_aportes *= 1 + taxa_mensal_reinvestimento
+        saldo_poupanca *= 1 + taxa_poupanca_mensal
 
         if mes % 12 == 1:
             ano_atual = (mes - 1) // 12 + 1
@@ -256,6 +319,7 @@ def simular_valor_futuro(
                 valor_evento = float(evento["Valor (R$)"])
                 if evento["Tipo de Evento"] == TIPO_EVENTO_APORTE_EXTRA:
                     saldo_novos_aportes += valor_evento
+                    saldo_poupanca += valor_evento
                     capital_investido += valor_evento
                     eventos_grafico.append({"mes": mes, "texto": "Aporte Extra"})
                 elif evento["Tipo de Evento"] == TIPO_EVENTO_NOVO_APORTE_MENSAL:
@@ -266,6 +330,7 @@ def simular_valor_futuro(
             aporte_mensal_atual *= 1 + TAXA_INFLACAO_APORTES
 
         saldo_novos_aportes += aporte_mensal_atual
+        saldo_poupanca += aporte_mensal_atual
         capital_investido += aporte_mensal_atual
 
         registros.append(
@@ -273,6 +338,7 @@ def simular_valor_futuro(
                 "mes": mes,
                 "saldo_inicial": saldo_inicial,
                 "saldo_novos_aportes": saldo_novos_aportes,
+                "saldo_poupanca": saldo_poupanca,
                 "capital_investido": capital_investido,
                 "saldo_bruto": saldo_inicial + saldo_novos_aportes,
             }
@@ -333,8 +399,13 @@ def montar_prompt_analise(resultados: dict) -> str:
         "os novos aportes foram reinvestidos a uma taxa de "
         f"{resultados['taxa_reinvestimento_pct']:.2f}% a.a., diferente da taxa "
         f"inicial de {resultados['taxa_ativo_pct']:.2f}% a.a. Mencione "
-        "brevemente o impacto dessa diferença de taxa na acumulação. Não "
-        "utilize emojis em nenhuma parte da resposta.\n\n"
+        "brevemente o impacto dessa diferença de taxa na acumulação. Inicie ou "
+        "finalize a sua análise destacando que "
+        f"{resultados['esforco_investidor_pct']:.0f}% do patrimônio final veio "
+        "do esforço do investidor (aportes) e "
+        f"{resultados['esforco_tempo_pct']:.0f}% veio do tempo (juros "
+        "compostos). Use essa proporção para tangibilizar o poder dos juros. "
+        "Não utilize emojis em nenhuma parte da resposta.\n\n"
         f"Total Investido: {formatar_moeda(resultados['total_investido'])}\n"
         f"Saldo Bruto: {formatar_moeda(resultados['saldo_bruto'])}\n"
         f"Impostos Pagos: {formatar_moeda(resultados['impostos'])}\n"
@@ -382,6 +453,16 @@ def renderizar_grafico_area_empilhada(df: pd.DataFrame, eventos: list[dict] | No
             hovertemplate="Mês %{x}<br>Juros Acumulados: R$ %{y:,.2f}<extra></extra>",
         )
     )
+    fig.add_trace(
+        go.Scatter(
+            x=df["mes"],
+            y=df["saldo_poupanca"],
+            name="Poupança (Referência)",
+            mode="lines",
+            line=dict(width=1.5, color="#CBD5E1", dash="dash"),
+            hovertemplate="Mês %{x}<br>Poupança (Referência): R$ %{y:,.2f}<extra></extra>",
+        )
+    )
     fig.update_layout(
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
@@ -414,6 +495,11 @@ def renderizar_valor_futuro() -> None:
 
     sufixo_reset = st.session_state.get(CHAVE_CONTADOR_RESET, 0)
 
+    try:
+        selic_pct_atual, cdi_pct_atual = obter_selic_cdi_atuais()
+    except Exception:
+        selic_pct_atual, cdi_pct_atual = None, None
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         aporte_inicial = st.number_input(
@@ -445,13 +531,24 @@ def renderizar_valor_futuro() -> None:
         )
 
     with st.expander("Configurações Avançadas de Aportes"):
+        taxa_reinvestimento_padrao = cdi_pct_atual if cdi_pct_atual is not None else TAXA_REINVESTIMENTO_PADRAO_PCT
         taxa_reinvestimento_pct = st.number_input(
             "Taxa de Reinvestimento para Novos Aportes (% a.a.)",
             min_value=0.0,
-            value=TAXA_REINVESTIMENTO_PADRAO_PCT,
+            value=taxa_reinvestimento_padrao,
             step=0.1,
             key=f"{CHAVE_TAXA_REINVESTIMENTO}_{sufixo_reset}",
         )
+        if cdi_pct_atual is not None:
+            st.caption(
+                f"Pré-preenchido com o CDI vigente ({cdi_pct_atual:.2f}% a.a.); edite se "
+                "quiser simular outra premissa de reinvestimento."
+            )
+        else:
+            st.caption(
+                f"Não foi possível obter o CDI vigente agora; pré-preenchido com "
+                f"{TAXA_REINVESTIMENTO_PADRAO_PCT:.2f}% a.a. como premissa padrão."
+            )
         st.caption(
             "O aporte inicial continua rendendo à taxa do ativo escolhido acima; "
             "todo dinheiro novo (aporte mensal e os eventos cadastrados abaixo) "
@@ -503,12 +600,30 @@ def renderizar_valor_futuro() -> None:
 
     taxa_reinvestimento_anual = taxa_reinvestimento_pct / 100
 
+    if selic_pct_atual is not None:
+        taxa_poupanca_mensal = calcular_taxa_poupanca_mensal(selic_pct_atual)
+        regra_poupanca = (
+            "0,50% a.m." if selic_pct_atual > LIMIAR_SELIC_POUPANCA_PCT
+            else f"{PERCENTUAL_POUPANCA_SOBRE_SELIC * 100:.0f}% da Selic a.a."
+        )
+        observacao_poupanca = (
+            f"Linha de referência 'Poupança' segue a regra oficial pós-2012 com a Selic "
+            f"vigente de {selic_pct_atual:.2f}% a.a. ({regra_poupanca} + TR, aqui simplificada com TR = 0)."
+        )
+    else:
+        taxa_poupanca_mensal = TAXA_POUPANCA_MENSAL_REGRA_ALTA
+        observacao_poupanca = (
+            "Não foi possível obter a Selic vigente agora; linha de referência 'Poupança' "
+            f"usando {TAXA_POUPANCA_MENSAL_REGRA_ALTA * 100:.2f}% a.m. como premissa padrão."
+        )
+
     df, eventos = simular_valor_futuro(
         aporte_inicial,
         aporte_mensal,
         taxa_anual,
         taxa_reinvestimento_anual,
         prazo_anos,
+        taxa_poupanca_mensal,
         eventos_df=eventos_editados,
         reajustar_inflacao=reajustar_inflacao,
     )
@@ -525,29 +640,73 @@ def renderizar_valor_futuro() -> None:
     impostos = calcular_impostos(categoria, lucro_tributavel, dias_corridos)
     saldo_liquido = linha_final["saldo_bruto"] - impostos["total"]
 
+    if linha_final["saldo_bruto"] > 0:
+        esforco_investidor_pct = linha_final["capital_investido"] / linha_final["saldo_bruto"] * 100
+        esforco_tempo_pct = linha_final["juros_acumulados"] / linha_final["saldo_bruto"] * 100
+    else:
+        esforco_investidor_pct = 0.0
+        esforco_tempo_pct = 0.0
+
     st.caption(
         f"Taxa bruta anual utilizada: {taxa_anual * 100:.2f}% ao ano. {observacao} "
-        f"Novos aportes reinvestidos a {taxa_reinvestimento_pct:.2f}% ao ano."
+        f"Novos aportes reinvestidos a {taxa_reinvestimento_pct:.2f}% ao ano. {observacao_poupanca}"
     )
 
-    col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("Total Investido", formatar_moeda(linha_final["capital_investido"], decimais=0))
-    col_b.metric("Saldo Bruto", formatar_moeda(linha_final["saldo_bruto"], decimais=0))
-    rotulo_imposto = "Impostos (IR + IOF)" if impostos["iof"] > 0 else "Impostos (IR)"
-    col_c.metric(rotulo_imposto, formatar_moeda(impostos["total"], decimais=0))
-    col_d.metric("Saldo Líquido", formatar_moeda(saldo_liquido, decimais=0))
+    try:
+        inflacao_implicita, metodologia_inflacao = obter_inflacao_implicita(prazo_anos)
+    except Exception:
+        inflacao_implicita, metodologia_inflacao = None, None
 
-    st.plotly_chart(renderizar_grafico_area_empilhada(df, eventos), use_container_width=True)
+    exibir_valores_reais = st.checkbox(
+        "Exibir valores em poder de compra de hoje (descontar a inflação implícita de mercado)",
+        key=f"{CHAVE_VALORES_REAIS}_{sufixo_reset}",
+        disabled=inflacao_implicita is None,
+    )
+    with st.expander("Como calculamos a inflação implícita de mercado?"):
+        if metodologia_inflacao:
+            st.write(metodologia_inflacao)
+        else:
+            st.write(
+                "Não foi possível calcular a inflação implícita agora, pois faltam "
+                "títulos Prefixados ou IPCA+ com prazo próximo ao simulado."
+            )
+
+    if exibir_valores_reais and inflacao_implicita is not None:
+        df_exibicao = converter_para_valores_reais(df, inflacao_implicita)
+        fator_deflator_final = (1 + inflacao_implicita) ** prazo_anos
+        st.caption(
+            f"Valores abaixo em poder de compra de hoje, descontados a "
+            f"{inflacao_implicita * 100:.2f}% a.a. de inflação implícita."
+        )
+    else:
+        df_exibicao = df
+        fator_deflator_final = 1.0
+        st.caption("Valores abaixo em termos nominais (sem desconto de inflação).")
+
+    linha_exibicao = df_exibicao.iloc[-1]
+    impostos_exibidos = impostos["total"] / fator_deflator_final
+    saldo_liquido_exibido = saldo_liquido / fator_deflator_final
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Total Investido", formatar_moeda(linha_exibicao["capital_investido"], decimais=0))
+    col_b.metric("Saldo Bruto", formatar_moeda(linha_exibicao["saldo_bruto"], decimais=0))
+    rotulo_imposto = "Impostos (IR + IOF)" if impostos["iof"] > 0 else "Impostos (IR)"
+    col_c.metric(rotulo_imposto, formatar_moeda(impostos_exibidos, decimais=0))
+    col_d.metric("Saldo Líquido", formatar_moeda(saldo_liquido_exibido, decimais=0))
+
+    st.plotly_chart(renderizar_grafico_area_empilhada(df_exibicao, eventos), use_container_width=True)
 
     st.divider()
     if st.button("Gerar Análise com IA"):
         resultados = {
-            "total_investido": linha_final["capital_investido"],
-            "saldo_bruto": linha_final["saldo_bruto"],
-            "impostos": impostos["total"],
-            "saldo_liquido": saldo_liquido,
+            "total_investido": linha_exibicao["capital_investido"],
+            "saldo_bruto": linha_exibicao["saldo_bruto"],
+            "impostos": impostos_exibidos,
+            "saldo_liquido": saldo_liquido_exibido,
             "taxa_ativo_pct": taxa_anual * 100,
             "taxa_reinvestimento_pct": taxa_reinvestimento_pct,
+            "esforco_investidor_pct": esforco_investidor_pct,
+            "esforco_tempo_pct": esforco_tempo_pct,
         }
         with st.spinner("Consultando o Gemini..."):
             try:
