@@ -83,11 +83,12 @@ PAGINAS = {
         ),
     },
     "Objetivos Financeiros": {
-        "titulo": "Simulador de Objetivos Financeiros (Acumulação)",
+        "titulo": "Simulador de Objetivos Financeiros (Teoria dos Baldes)",
         "descricao": (
-            "Aqui o usuário vai projetar a acumulação de patrimônio ao longo "
-            "do tempo, com aporte inicial, aportes mensais e opção de step-up, "
-            "separando capital investido e juros compostos."
+            "Aqui o usuário divide um único aporte mensal entre três objetivos "
+            "simultâneos (curto, médio e longo prazo). Quando um objetivo é "
+            "atingido, o dinheiro que ia para ele é redirecionado para acelerar "
+            "os objetivos seguintes — o efeito cascata."
         ),
     },
     "Análise com IA": {
@@ -137,6 +138,10 @@ PERCENTUAL_POUPANCA_SOBRE_SELIC = 0.7
 DIAS_UTEIS_ANO = 252
 PRAZO_MAXIMO_ANOS = 30
 
+ORDEM_BALDES = ["curto", "medio", "longo"]
+FATIA_INICIAL_BALDES = {"curto": 0.40, "medio": 0.30, "longo": 0.30}
+LIMITE_MESES_SEGURANCA_BALDES = 1200
+
 TIPO_EVENTO_APORTE_EXTRA = "Aporte Extra Único"
 TIPO_EVENTO_NOVO_APORTE_MENSAL = "Novo Aporte Mensal"
 TIPOS_EVENTO = [TIPO_EVENTO_APORTE_EXTRA, TIPO_EVENTO_NOVO_APORTE_MENSAL]
@@ -156,6 +161,15 @@ CHAVE_CONTADOR_RESET = "valor_futuro_reset_contador"
 CHAVE_MM_TIPO_TITULO = "marcacao_tipo_titulo"
 CHAVE_MM_VENCIMENTO = "marcacao_vencimento"
 CHAVE_MM_DELTA_TAXA = "marcacao_delta_taxa"
+
+CHAVE_OF_APORTE_MENSAL_TOTAL = "objetivos_aporte_mensal_total"
+CHAVE_OF_TAXA_ESPERADA = "objetivos_taxa_esperada"
+CHAVE_OF_NOME_CURTO = "objetivos_nome_curto"
+CHAVE_OF_VALOR_CURTO = "objetivos_valor_curto"
+CHAVE_OF_NOME_MEDIO = "objetivos_nome_medio"
+CHAVE_OF_VALOR_MEDIO = "objetivos_valor_medio"
+CHAVE_OF_NOME_LONGO = "objetivos_nome_longo"
+CHAVE_OF_VALOR_LONGO = "objetivos_valor_longo"
 
 MODELO_GEMINI = "gemini-flash-latest"
 
@@ -347,6 +361,84 @@ def montar_prompt_analise_marcacao(resultados: dict) -> str:
         f"PU Simulado: {formatar_moeda(resultados['pu_novo'])}\n"
         f"Ágio/Deságio: {formatar_moeda(resultados['pu_novo'] - resultados['pu_atual'])} "
         f"({resultados['variacao_pct']:+.2f}%)\n"
+    )
+
+
+def simular_baldes_cascata(
+    aporte_mensal_total: float,
+    taxa_anual: float,
+    valores_alvo: dict[str, float],
+) -> tuple[pd.DataFrame, dict[str, int | None]]:
+    """Distribui um aporte mensal único entre três baldes (curto/médio/longo prazo).
+
+    Quando um balde atinge sua meta, seu saldo é travado (para de receber aporte e de
+    render) e a fatia do aporte que ia para ele é redirecionada ao próximo balde ainda
+    aberto na ordem curto -> médio -> longo (efeito cascata). Roda mês a mês até que os
+    três baldes atinjam a meta, com um limite de segurança de meses.
+    """
+    taxa_mensal = (1 + taxa_anual) ** (1 / 12) - 1
+    fatia = dict(FATIA_INICIAL_BALDES)
+    saldo = {chave: 0.0 for chave in ORDEM_BALDES}
+    trancado = {chave: False for chave in ORDEM_BALDES}
+    mes_atingido: dict[str, int | None] = {chave: None for chave in ORDEM_BALDES}
+
+    registros = [{"mes": 0, **{f"saldo_{chave}": 0.0 for chave in ORDEM_BALDES}}]
+
+    mes = 0
+    while not all(trancado.values()) and mes < LIMITE_MESES_SEGURANCA_BALDES:
+        mes += 1
+        for chave in ORDEM_BALDES:
+            if trancado[chave]:
+                continue
+            saldo[chave] *= 1 + taxa_mensal
+            saldo[chave] += fatia[chave] * aporte_mensal_total
+            if saldo[chave] >= valores_alvo[chave]:
+                trancado[chave] = True
+                mes_atingido[chave] = mes
+                fatia_liberada = fatia[chave]
+                fatia[chave] = 0.0
+                indice = ORDEM_BALDES.index(chave)
+                destino = next((c for c in ORDEM_BALDES[indice + 1 :] if not trancado[c]), None)
+                if destino is None:
+                    destino = next((c for c in ORDEM_BALDES if not trancado[c]), None)
+                if destino is not None:
+                    fatia[destino] += fatia_liberada
+        registros.append({"mes": mes, **{f"saldo_{chave}": saldo[chave] for chave in ORDEM_BALDES}})
+
+    return pd.DataFrame(registros), mes_atingido
+
+
+def formatar_anos_meses(total_meses: int | None) -> str:
+    if total_meses is None:
+        return f"Não atingida em {LIMITE_MESES_SEGURANCA_BALDES // 12} anos"
+    anos, meses = divmod(total_meses, 12)
+    partes = []
+    if anos:
+        partes.append(f"{anos} ano{'s' if anos != 1 else ''}")
+    if meses or not partes:
+        partes.append(f"{meses} {'mês' if meses == 1 else 'meses'}")
+    return " e ".join(partes)
+
+
+def montar_prompt_analise_baldes(resultados: dict) -> str:
+    return (
+        "Você é um analista financeiro. Explique para um investidor leigo, em português "
+        "do Brasil e em no máximo 150 palavras, o resultado de uma simulação de "
+        "planejamento financeiro com três objetivos simultâneos (curto, médio e longo "
+        "prazo) usando a técnica dos baldes: um único aporte mensal é dividido entre as "
+        "três metas e, assim que uma meta é atingida, o valor que ia para ela é "
+        "redirecionado para acelerar as metas seguintes (efeito cascata). Destaque a "
+        "força da consistência e do efeito cascata na alocação de capital, usando os "
+        "prazos abaixo como exemplo concreto. Não utilize emojis em nenhuma parte da "
+        "resposta.\n\n"
+        f"Aporte mensal total: {formatar_moeda(resultados['aporte_mensal_total'])}\n"
+        f"Taxa de rendimento esperada: {resultados['taxa_esperada_pct']:.2f}% a.a.\n"
+        f"{resultados['nome_curto']} (meta de {formatar_moeda(resultados['valor_curto'])}): "
+        f"atingida em {resultados['tempo_curto']}\n"
+        f"{resultados['nome_medio']} (meta de {formatar_moeda(resultados['valor_medio'])}): "
+        f"atingida em {resultados['tempo_medio']}\n"
+        f"{resultados['nome_longo']} (meta de {formatar_moeda(resultados['valor_longo'])}): "
+        f"atingida em {resultados['tempo_longo']}\n"
     )
 
 
@@ -1037,6 +1129,159 @@ def renderizar_marcacao_mercado() -> None:
                 st.error(f"Não foi possível gerar a análise agora: {exc}")
 
 
+def renderizar_grafico_baldes_cascata(df: pd.DataFrame, mes_atingido: dict, nomes: dict) -> go.Figure:
+    cores = {"curto": "#F19828", "medio": "#8AA0B9", "longo": "#173451"}
+    fig = go.Figure()
+    for chave in ORDEM_BALDES:
+        fig.add_trace(
+            go.Scatter(
+                x=df["mes"],
+                y=df[f"saldo_{chave}"],
+                name=nomes[chave],
+                mode="lines",
+                stackgroup="one",
+                line=dict(width=0.5, color=cores[chave]),
+                fillcolor=cores[chave],
+                hovertemplate=f"Mês %{{x}}<br>{nomes[chave]}: R$ %{{y:,.2f}}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        font=dict(family="Inter, sans-serif", color="#2D3748"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0),
+        margin=dict(l=10, r=10, t=70, b=10),
+        hovermode="x unified",
+        xaxis=dict(title="Meses", showgrid=False, zeroline=False),
+        yaxis=dict(title="Valor (R$)", showgrid=True, gridcolor="#E2E8F0", zeroline=False, tickprefix="R$ "),
+    )
+
+    posicoes_anotacao = ["top left", "top right"]
+    chaves_com_marco = [chave for chave in ORDEM_BALDES[:-1] if mes_atingido[chave] is not None]
+    for indice, chave in enumerate(chaves_com_marco):
+        fig.add_vline(
+            x=mes_atingido[chave],
+            line_dash="dash",
+            line_color="#2D3748",
+            annotation_text=f"{nomes[chave]}: meta atingida",
+            annotation_position=posicoes_anotacao[indice % len(posicoes_anotacao)],
+            annotation_font_color="#2D3748",
+            annotation_font_size=11,
+        )
+
+    return fig
+
+
+def renderizar_objetivos_financeiros() -> None:
+    st.header(PAGINAS["Objetivos Financeiros"]["titulo"])
+    st.write(PAGINAS["Objetivos Financeiros"]["descricao"])
+
+    sufixo_reset = st.session_state.get(CHAVE_CONTADOR_RESET, 0)
+
+    try:
+        _, cdi_pct_atual = obter_selic_cdi_atuais()
+    except Exception:
+        cdi_pct_atual = None
+
+    col1, col2 = st.columns(2)
+    with col1:
+        aporte_mensal_total = st.number_input(
+            "Aporte Mensal Total Disponível (R$)",
+            min_value=0.0,
+            value=1000.0,
+            step=50.0,
+            key=f"{CHAVE_OF_APORTE_MENSAL_TOTAL}_{sufixo_reset}",
+        )
+    with col2:
+        taxa_esperada_padrao = cdi_pct_atual if cdi_pct_atual is not None else TAXA_REINVESTIMENTO_PADRAO_PCT
+        taxa_esperada_pct = st.number_input(
+            "Taxa de Rendimento Esperada (% a.a.)",
+            min_value=0.0,
+            value=taxa_esperada_padrao,
+            step=0.1,
+            key=f"{CHAVE_OF_TAXA_ESPERADA}_{sufixo_reset}",
+        )
+
+    st.caption(
+        f"Distribuição inicial do aporte: {FATIA_INICIAL_BALDES['curto'] * 100:.0f}% Curto Prazo, "
+        f"{FATIA_INICIAL_BALDES['medio'] * 100:.0f}% Médio Prazo, {FATIA_INICIAL_BALDES['longo'] * 100:.0f}% "
+        "Longo Prazo. Quando um objetivo é atingido, a fatia dele é redirecionada para acelerar os "
+        "objetivos seguintes (efeito cascata)."
+    )
+
+    col_curto, col_medio, col_longo = st.columns(3)
+    with col_curto:
+        st.markdown("**Curto Prazo**")
+        nome_curto = st.text_input(
+            "Nome do Objetivo", value="Reserva de Emergência", key=f"{CHAVE_OF_NOME_CURTO}_{sufixo_reset}"
+        )
+        valor_curto = st.number_input(
+            "Valor Alvo (R$)", min_value=100.0, value=10000.0, step=500.0, key=f"{CHAVE_OF_VALOR_CURTO}_{sufixo_reset}"
+        )
+    with col_medio:
+        st.markdown("**Médio Prazo**")
+        nome_medio = st.text_input(
+            "Nome do Objetivo", value="Entrada do Imóvel", key=f"{CHAVE_OF_NOME_MEDIO}_{sufixo_reset}"
+        )
+        valor_medio = st.number_input(
+            "Valor Alvo (R$)", min_value=100.0, value=50000.0, step=1000.0, key=f"{CHAVE_OF_VALOR_MEDIO}_{sufixo_reset}"
+        )
+    with col_longo:
+        st.markdown("**Longo Prazo**")
+        nome_longo = st.text_input(
+            "Nome do Objetivo", value="Aposentadoria", key=f"{CHAVE_OF_NOME_LONGO}_{sufixo_reset}"
+        )
+        valor_longo = st.number_input(
+            "Valor Alvo (R$)", min_value=100.0, value=300000.0, step=5000.0, key=f"{CHAVE_OF_VALOR_LONGO}_{sufixo_reset}"
+        )
+
+    if aporte_mensal_total <= 0:
+        st.warning("Informe um aporte mensal maior que zero para simular os objetivos.")
+        return
+
+    nomes = {"curto": nome_curto, "medio": nome_medio, "longo": nome_longo}
+    valores_alvo = {"curto": valor_curto, "medio": valor_medio, "longo": valor_longo}
+
+    df, mes_atingido = simular_baldes_cascata(aporte_mensal_total, taxa_esperada_pct / 100, valores_alvo)
+
+    tempos = {chave: formatar_anos_meses(mes_atingido[chave]) for chave in ORDEM_BALDES}
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric(nome_curto, tempos["curto"])
+    col_b.metric(nome_medio, tempos["medio"])
+    col_c.metric(nome_longo, tempos["longo"])
+
+    if any(mes_atingido[chave] is None for chave in ORDEM_BALDES):
+        st.warning(
+            f"Pelo menos um objetivo não foi atingido em {LIMITE_MESES_SEGURANCA_BALDES // 12} anos com "
+            "essas premissas. Considere aumentar o aporte mensal ou reduzir os valores-alvo."
+        )
+
+    st.plotly_chart(renderizar_grafico_baldes_cascata(df, mes_atingido, nomes), use_container_width=True)
+
+    st.divider()
+    if st.button("Gerar Análise com IA", key=f"objetivos_btn_ia_{sufixo_reset}"):
+        resultados = {
+            "aporte_mensal_total": aporte_mensal_total,
+            "taxa_esperada_pct": taxa_esperada_pct,
+            "nome_curto": nome_curto,
+            "valor_curto": valor_curto,
+            "tempo_curto": tempos["curto"],
+            "nome_medio": nome_medio,
+            "valor_medio": valor_medio,
+            "tempo_medio": tempos["medio"],
+            "nome_longo": nome_longo,
+            "valor_longo": valor_longo,
+            "tempo_longo": tempos["longo"],
+        }
+        with st.spinner("Consultando o Gemini..."):
+            try:
+                texto_analise = gerar_analise_ia(montar_prompt_analise_baldes(resultados))
+                st.info(texto_analise.replace("$", "\\$"), icon=None)
+            except Exception as exc:
+                st.error(f"Não foi possível gerar a análise agora: {exc}")
+
+
 with st.sidebar:
     if st.button("Reiniciar Premissas", use_container_width=True):
         st.session_state[CHAVE_CONTADOR_RESET] = st.session_state.get(CHAVE_CONTADOR_RESET, 0) + 1
@@ -1053,6 +1298,8 @@ if pagina_selecionada == "Valor Futuro":
     renderizar_valor_futuro()
 elif pagina_selecionada == "Marcação a Mercado":
     renderizar_marcacao_mercado()
+elif pagina_selecionada == "Objetivos Financeiros":
+    renderizar_objetivos_financeiros()
 else:
     pagina = PAGINAS[pagina_selecionada]
     st.header(pagina["titulo"])
