@@ -91,20 +91,13 @@ PAGINAS = {
             "os objetivos seguintes — o efeito cascata."
         ),
     },
-    "Análise com IA": {
-        "titulo": "Análise Generativa (LLM)",
+    "Viver de Renda": {
+        "titulo": "Viver de Renda (Perpetuidade)",
         "descricao": (
-            "Aqui o sistema vai exibir uma análise textual gerada por IA, "
-            "traduzindo os resultados numéricos das outras abas em uma "
-            "explicação simples e direta."
-        ),
-    },
-    "Planejamento de Metas": {
-        "titulo": "Planejamento de Metas",
-        "descricao": (
-            "Aqui o usuário vai informar um valor alvo futuro e o sistema vai "
-            "calcular o aporte mensal necessário para atingir esse objetivo no "
-            "prazo estipulado."
+            "Aqui o usuário simula a fase de usufruição do patrimônio: resgates "
+            "mensais fixos sobre um patrimônio acumulado, para ver se a renda é "
+            "sustentável ao longo do prazo analisado ou se o dinheiro se esgota "
+            "antes disso."
         ),
     },
 }
@@ -142,6 +135,9 @@ ORDEM_BALDES = ["curto", "medio", "longo"]
 FATIA_INICIAL_BALDES = {"curto": 0.40, "medio": 0.30, "longo": 0.30}
 LIMITE_MESES_SEGURANCA_BALDES = 1200
 
+PRAZO_MINIMO_VIVER_RENDA_ANOS = 10
+PRAZO_MAXIMO_VIVER_RENDA_ANOS = 50
+
 TIPO_EVENTO_APORTE_EXTRA = "Aporte Extra Único"
 TIPO_EVENTO_NOVO_APORTE_MENSAL = "Novo Aporte Mensal"
 TIPOS_EVENTO = [TIPO_EVENTO_APORTE_EXTRA, TIPO_EVENTO_NOVO_APORTE_MENSAL]
@@ -170,6 +166,11 @@ CHAVE_OF_NOME_MEDIO = "objetivos_nome_medio"
 CHAVE_OF_VALOR_MEDIO = "objetivos_valor_medio"
 CHAVE_OF_NOME_LONGO = "objetivos_nome_longo"
 CHAVE_OF_VALOR_LONGO = "objetivos_valor_longo"
+
+CHAVE_VR_PATRIMONIO = "viver_renda_patrimonio"
+CHAVE_VR_CUSTO_MENSAL = "viver_renda_custo_mensal"
+CHAVE_VR_TAXA_REAL = "viver_renda_taxa_real"
+CHAVE_VR_PRAZO_ANOS = "viver_renda_prazo_anos"
 
 MODELO_GEMINI = "gemini-flash-latest"
 
@@ -439,6 +440,59 @@ def montar_prompt_analise_baldes(resultados: dict) -> str:
         f"atingida em {resultados['tempo_medio']}\n"
         f"{resultados['nome_longo']} (meta de {formatar_moeda(resultados['valor_longo'])}): "
         f"atingida em {resultados['tempo_longo']}\n"
+    )
+
+
+def simular_drawdown(
+    patrimonio_inicial: float,
+    custo_vida_mensal: float,
+    taxa_real_anual: float,
+    prazo_anos: int,
+) -> tuple[pd.DataFrame, int | None]:
+    """Simula mês a mês o saldo de um patrimônio em fase de usufruição: rende a taxa real
+    da carteira e subtrai o resgate mensal fixo. Para no mês em que o saldo zera ou fica
+    negativo (o dinheiro acabou) ou ao final do prazo, o que ocorrer primeiro.
+    """
+    taxa_real_mensal = (1 + taxa_real_anual) ** (1 / 12) - 1
+    prazo_meses = prazo_anos * 12
+    saldo = patrimonio_inicial
+    registros = [{"mes": 0, "saldo": saldo}]
+    mes_esgotamento = None
+    for mes in range(1, prazo_meses + 1):
+        saldo = saldo * (1 + taxa_real_mensal) - custo_vida_mensal
+        if saldo <= 0:
+            mes_esgotamento = mes
+            registros.append({"mes": mes, "saldo": 0.0})
+            break
+        registros.append({"mes": mes, "saldo": saldo})
+    return pd.DataFrame(registros), mes_esgotamento
+
+
+def montar_prompt_analise_viver_de_renda(resultados: dict) -> str:
+    situacao = (
+        "o patrimônio se manteve sustentável até o fim do prazo analisado"
+        if resultados["sustentavel"]
+        else f"o patrimônio se esgotou em {resultados['tempo_duracao']}"
+    )
+    return (
+        "Você é um analista financeiro. Explique para um investidor leigo, em português "
+        "do Brasil e em no máximo 150 palavras, o resultado de uma simulação da fase de "
+        "usufruição do patrimônio (viver de renda), na qual o investidor faz retiradas "
+        f"mensais fixas de {formatar_moeda(resultados['custo_vida_mensal'])} de um patrimônio "
+        f"de {formatar_moeda(resultados['patrimonio_acumulado'])}, com rentabilidade real "
+        f"esperada de {resultados['taxa_real_pct']:.2f}% ao ano acima da inflação, ao longo de "
+        f"um prazo de {resultados['prazo_anos']} anos. Nessa simulação, {situacao}. A taxa de "
+        f"retirada anual implícita é de {resultados['taxa_retirada_anual_pct']:.2f}% do "
+        "patrimônio. Explique brevemente a dinâmica entre a rentabilidade real da carteira e "
+        "a taxa de retirada segura (Safe Withdrawal Rate): por que retirar mais do que a "
+        "carteira rende em termos reais consome o principal e pode levar à descapitalização, "
+        "enquanto retirar dentro do limite da rentabilidade real preserva o patrimônio "
+        "indefinidamente. Não utilize emojis em nenhuma parte da resposta.\n\n"
+        f"Patrimônio Acumulado: {formatar_moeda(resultados['patrimonio_acumulado'])}\n"
+        f"Custo de Vida Mensal: {formatar_moeda(resultados['custo_vida_mensal'])}\n"
+        f"Rentabilidade Real: {resultados['taxa_real_pct']:.2f}% a.a.\n"
+        f"Taxa de Retirada Anual: {resultados['taxa_retirada_anual_pct']:.2f}% a.a.\n"
+        f"Resgate Mensal Máximo Sustentável: {formatar_moeda(resultados['resgate_maximo_sustentavel'])}\n"
     )
 
 
@@ -1282,6 +1336,142 @@ def renderizar_objetivos_financeiros() -> None:
                 st.error(f"Não foi possível gerar a análise agora: {exc}")
 
 
+def renderizar_grafico_viver_de_renda(df: pd.DataFrame, sustentavel: bool) -> go.Figure:
+    cor = "#173451" if sustentavel else "#F19828"
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["mes"],
+            y=df["saldo"],
+            mode="lines",
+            fill="tozeroy",
+            line=dict(width=2, color=cor),
+            fillcolor=cor,
+            hovertemplate="Mês %{x}<br>Saldo: R$ %{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_hline(y=0, line_color="#8AA0B9", line_width=1)
+    fig.update_layout(
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        font=dict(family="Inter, sans-serif", color="#2D3748"),
+        margin=dict(l=10, r=10, t=30, b=10),
+        hovermode="x unified",
+        showlegend=False,
+        xaxis=dict(title="Meses", showgrid=False, zeroline=False),
+        yaxis=dict(title="Saldo (R$)", showgrid=True, gridcolor="#E2E8F0", zeroline=False, tickprefix="R$ "),
+    )
+    return fig
+
+
+def renderizar_viver_de_renda() -> None:
+    st.header(PAGINAS["Viver de Renda"]["titulo"])
+    st.write(PAGINAS["Viver de Renda"]["descricao"])
+
+    sufixo_reset = st.session_state.get(CHAVE_CONTADOR_RESET, 0)
+
+    prazo_anos = st.slider(
+        "Expectativa de Vida / Prazo de Análise (anos)",
+        min_value=PRAZO_MINIMO_VIVER_RENDA_ANOS,
+        max_value=PRAZO_MAXIMO_VIVER_RENDA_ANOS,
+        value=30,
+        key=f"{CHAVE_VR_PRAZO_ANOS}_{sufixo_reset}",
+    )
+
+    try:
+        taxa_real_ipca_pct = _taxa_titulo_mais_proximo(get_titulos_ipca(), prazo_anos)
+    except Exception:
+        taxa_real_ipca_pct = None
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        patrimonio_acumulado = st.number_input(
+            "Patrimônio Acumulado (R$)",
+            min_value=0.0,
+            value=1000000.0,
+            step=10000.0,
+            key=f"{CHAVE_VR_PATRIMONIO}_{sufixo_reset}",
+        )
+    with col2:
+        custo_vida_mensal = st.number_input(
+            "Custo de Vida Mensal (Resgate Desejado) (R$)",
+            min_value=0.0,
+            value=5000.0,
+            step=100.0,
+            key=f"{CHAVE_VR_CUSTO_MENSAL}_{sufixo_reset}",
+        )
+    with col3:
+        taxa_real_padrao = taxa_real_ipca_pct if taxa_real_ipca_pct is not None else 4.0
+        taxa_real_pct = st.number_input(
+            "Rentabilidade Real Esperada (% a.a. acima da inflação)",
+            min_value=-20.0,
+            value=taxa_real_padrao,
+            step=0.1,
+            key=f"{CHAVE_VR_TAXA_REAL}_{sufixo_reset}",
+        )
+    if taxa_real_ipca_pct is not None:
+        st.caption(
+            f"Pré-preenchido com a taxa real do Tesouro IPCA+ de prazo mais próximo a "
+            f"{prazo_anos} anos ({taxa_real_ipca_pct:.2f}% a.a.); edite à vontade."
+        )
+    else:
+        st.caption(
+            "Não foi possível obter a taxa real de mercado agora; pré-preenchido com 4,00% a.a. "
+            "como premissa padrão."
+        )
+
+    taxa_retirada_anual_pct = (
+        custo_vida_mensal * 12 / patrimonio_acumulado * 100 if patrimonio_acumulado > 0 else 0.0
+    )
+    st.caption(
+        f"Taxa de retirada anual implícita: {taxa_retirada_anual_pct:.2f}% do patrimônio ao ano "
+        "(referência: a regra dos 4% sugere um teto de retiradas seguras em torno de 4% a.a.)."
+    )
+
+    df, mes_esgotamento = simular_drawdown(
+        patrimonio_acumulado, custo_vida_mensal, taxa_real_pct / 100, prazo_anos
+    )
+    sustentavel = mes_esgotamento is None
+
+    taxa_real_mensal = (1 + taxa_real_pct / 100) ** (1 / 12) - 1
+    resgate_maximo_sustentavel = patrimonio_acumulado * taxa_real_mensal
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if sustentavel:
+            st.metric("Status", "Renda Sustentável")
+        else:
+            st.metric("Status", f"O dinheiro acaba em: {formatar_anos_meses(mes_esgotamento)}")
+    with col_b:
+        st.metric("Resgate Mensal Máximo Sustentável", formatar_moeda(resgate_maximo_sustentavel))
+    st.caption(
+        "Resgate mensal máximo sustentável: o valor que poderia ser sacado todo mês mantendo "
+        "o patrimônio estável para sempre (nem cresce, nem encolhe), na rentabilidade real "
+        "informada acima."
+    )
+
+    st.plotly_chart(renderizar_grafico_viver_de_renda(df, sustentavel), use_container_width=True)
+
+    st.divider()
+    if st.button("Gerar Análise com IA", key=f"viver_renda_btn_ia_{sufixo_reset}"):
+        resultados = {
+            "patrimonio_acumulado": patrimonio_acumulado,
+            "custo_vida_mensal": custo_vida_mensal,
+            "taxa_real_pct": taxa_real_pct,
+            "prazo_anos": prazo_anos,
+            "taxa_retirada_anual_pct": taxa_retirada_anual_pct,
+            "resgate_maximo_sustentavel": resgate_maximo_sustentavel,
+            "sustentavel": sustentavel,
+            "tempo_duracao": formatar_anos_meses(mes_esgotamento) if not sustentavel else None,
+        }
+        with st.spinner("Consultando o Gemini..."):
+            try:
+                texto_analise = gerar_analise_ia(montar_prompt_analise_viver_de_renda(resultados))
+                st.info(texto_analise.replace("$", "\\$"), icon=None)
+            except Exception as exc:
+                st.error(f"Não foi possível gerar a análise agora: {exc}")
+
+
 with st.sidebar:
     if st.button("Reiniciar Premissas", use_container_width=True):
         st.session_state[CHAVE_CONTADOR_RESET] = st.session_state.get(CHAVE_CONTADOR_RESET, 0) + 1
@@ -1300,7 +1490,5 @@ elif pagina_selecionada == "Marcação a Mercado":
     renderizar_marcacao_mercado()
 elif pagina_selecionada == "Objetivos Financeiros":
     renderizar_objetivos_financeiros()
-else:
-    pagina = PAGINAS[pagina_selecionada]
-    st.header(pagina["titulo"])
-    st.write(pagina["descricao"])
+elif pagina_selecionada == "Viver de Renda":
+    renderizar_viver_de_renda()
