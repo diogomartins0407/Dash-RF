@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
+import google.genai as genai
 
 from data_fetch import (
     get_cotacoes_etfs,
@@ -788,27 +788,19 @@ def renderizar_valor_futuro() -> None:
             step=0.1,
             key=f"{CHAVE_TAXA_REINVESTIMENTO}_{sufixo_reset}",
         )
-        if cdi_pct_atual is not None:
-            st.caption(
-                f"Pré-preenchido com o CDI vigente ({cdi_pct_atual:.2f}% a.a.); edite se "
-                "quiser simular outra premissa de reinvestimento."
-            )
-        else:
-            st.caption(
-                f"Não foi possível obter o CDI vigente agora; pré-preenchido com "
-                f"{TAXA_REINVESTIMENTO_PADRAO_PCT:.2f}% a.a. como premissa padrão."
-            )
+        detalhe_taxa_reinvestimento = (
+            f"Pré-preenchido com o CDI vigente ({cdi_pct_atual:.2f}% a.a.)."
+            if cdi_pct_atual is not None
+            else f"CDI indisponível agora; pré-preenchido com {TAXA_REINVESTIMENTO_PADRAO_PCT:.2f}% a.a."
+        )
         st.caption(
-            "O aporte inicial continua rendendo à taxa do ativo escolhido acima; "
-            "todo dinheiro novo (aporte mensal e os eventos cadastrados abaixo) "
-            "rende a esta taxa de reinvestimento, isolando o risco de reinvestir "
-            "novos aportes a uma taxa diferente da atual."
+            f"{detalhe_taxa_reinvestimento} O aporte inicial rende à taxa do ativo escolhido "
+            "acima; todo dinheiro novo (aporte mensal e eventos abaixo) rende a esta taxa."
         )
 
         st.caption(
-            "Cadastre quantos eventos quiser: aportes extraordinários pontuais "
-            "ou alterações do aporte mensal recorrente, cada um no ano em que "
-            "deve entrar em vigor."
+            "Cadastre aportes extras pontuais ou mudanças no aporte mensal recorrente, "
+            "cada um no ano em que devem entrar em vigor."
         )
 
         eventos_editados = st.data_editor(
@@ -897,8 +889,8 @@ def renderizar_valor_futuro() -> None:
         esforco_tempo_pct = 0.0
 
     st.caption(
-        f"Taxa bruta anual utilizada: {taxa_anual * 100:.2f}% ao ano. {observacao} "
-        f"Novos aportes reinvestidos a {taxa_reinvestimento_pct:.2f}% ao ano. {observacao_poupanca}"
+        f"Taxa bruta utilizada: {taxa_anual * 100:.2f}% a.a. · Reinvestimento: "
+        f"{taxa_reinvestimento_pct:.2f}% a.a."
     )
 
     try:
@@ -907,30 +899,27 @@ def renderizar_valor_futuro() -> None:
         inflacao_implicita, metodologia_inflacao = None, None
 
     exibir_valores_reais = st.checkbox(
-        "Exibir valores em poder de compra de hoje (descontar a inflação implícita de mercado)",
+        "Exibir valores em poder de compra de hoje",
         key=f"{CHAVE_VALORES_REAIS}_{sufixo_reset}",
         disabled=inflacao_implicita is None,
     )
-    with st.expander("Como calculamos a inflação implícita de mercado?"):
-        if metodologia_inflacao:
-            st.write(metodologia_inflacao)
-        else:
-            st.write(
-                "Não foi possível calcular a inflação implícita agora, pois faltam "
-                "títulos Prefixados ou IPCA+ com prazo próximo ao simulado."
-            )
+    with st.expander("Premissas e metodologia desta simulação"):
+        st.write(observacao)
+        st.write(observacao_poupanca)
+        st.write(
+            metodologia_inflacao
+            or "Não foi possível calcular a inflação implícita agora, pois faltam títulos "
+            "Prefixados ou IPCA+ com prazo próximo ao simulado."
+        )
 
     if exibir_valores_reais and inflacao_implicita is not None:
         df_exibicao = converter_para_valores_reais(df, inflacao_implicita)
         fator_deflator_final = (1 + inflacao_implicita) ** prazo_anos
-        st.caption(
-            f"Valores abaixo em poder de compra de hoje, descontados a "
-            f"{inflacao_implicita * 100:.2f}% a.a. de inflação implícita."
-        )
+        st.caption(f"Valores em poder de compra de hoje (descontados {inflacao_implicita * 100:.2f}% a.a.).")
     else:
         df_exibicao = df
         fator_deflator_final = 1.0
-        st.caption("Valores abaixo em termos nominais (sem desconto de inflação).")
+        st.caption("Valores em termos nominais.")
 
     linha_exibicao = df_exibicao.iloc[-1]
     impostos_exibidos = impostos["total"] / fator_deflator_final
@@ -1042,11 +1031,8 @@ def renderizar_marcacao_mercado() -> None:
                     "sobre a Selic."
                 )
         st.info(
-            "O Tesouro Selic (LFT) tem seu rendimento atrelado à Selic diariamente, então seu "
-            "preço acompanha o valor justo quase todo dia — a marcação a mercado praticamente "
-            "não gera ágio ou deságio relevante neste título, mesmo em cenários de estresse na "
-            "curva de juros. É por isso que ele costuma ser o mais indicado para reserva de "
-            "emergência: baixo risco de perda se você precisar vender antes do vencimento."
+            "O Tesouro Selic acompanha a Selic diariamente, então seu preço mal se move com "
+            "estresse na curva de juros — por isso é o mais indicado para reserva de emergência."
         )
         return
 
@@ -1073,41 +1059,37 @@ def renderizar_marcacao_mercado() -> None:
     du_uteis = calcular_du_uteis(titulo_escolhido["data_vencimento"])
     duration_anos = calcular_duration_anos(du_uteis)
 
-    st.caption(
-        f"Faltam {duration_anos:.1f} anos até o vencimento. Como este título não paga cupom, "
-        f"a duration (sensibilidade do preço a mudanças na taxa) é igual ao prazo: "
-        f"{duration_anos:.1f} anos — quanto maior, maior o efeito de qualquer variação na taxa "
-        "sobre o preço. Considera apenas dias úteis, sem contar feriados."
-    )
+    st.caption(f"Faltam {duration_anos:.1f} anos até o vencimento (= duration, título sem cupom).")
+
+    chave_delta_taxa = f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}"
+    if chave_delta_taxa not in st.session_state:
+        st.session_state[chave_delta_taxa] = 0.0
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("Cenário Otimista: taxa cai", use_container_width=True):
-            st.session_state[f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}"] = DELTA_CENARIO_OTIMISTA_PP
+            st.session_state[chave_delta_taxa] = DELTA_CENARIO_OTIMISTA_PP
     with col_btn2:
         if st.button("Cenário de Estresse: taxa sobe", use_container_width=True):
-            st.session_state[f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}"] = DELTA_CENARIO_ESTRESSE_PP
+            st.session_state[chave_delta_taxa] = DELTA_CENARIO_ESTRESSE_PP
 
     delta_taxa_pp = st.slider(
         "Ajuste na taxa deste título (pontos percentuais)",
         min_value=-DELTA_TAXA_MAXIMO_PP,
         max_value=DELTA_TAXA_MAXIMO_PP,
-        value=0.0,
         step=0.1,
-        key=f"{CHAVE_MM_DELTA_TAXA}_{sufixo_reset}",
+        key=chave_delta_taxa,
     )
 
     if delta_taxa_pp > 0:
         st.caption(
-            f"Se a taxa deste título subir {delta_taxa_pp:.2f} pontos percentuais, o preço cai "
-            "(deságio) — quem vender antes do vencimento recebe menos do que o valor aplicado "
-            "corrigido pela taxa contratada."
+            f"Taxa sobe {delta_taxa_pp:.2f} p.p. → preço cai (deságio) para quem vende antes "
+            "do vencimento."
         )
     elif delta_taxa_pp < 0:
         st.caption(
-            f"Se a taxa deste título cair {abs(delta_taxa_pp):.2f} pontos percentuais, o preço "
-            "sobe (ágio) — quem vender antes do vencimento recebe mais do que o valor aplicado "
-            "corrigido pela taxa contratada."
+            f"Taxa cai {abs(delta_taxa_pp):.2f} p.p. → preço sobe (ágio) para quem vende antes "
+            "do vencimento."
         )
     else:
         st.caption("Ajuste a taxa acima (ou use os botões de cenário) para simular uma venda antecipada.")
@@ -1134,10 +1116,8 @@ def renderizar_marcacao_mercado() -> None:
 
     st.subheader("Comparativo entre vencimentos")
     st.caption(
-        f"Todos os vencimentos de {tipo_titulo_nome} sob o mesmo cenário simulado acima "
-        f"({delta_taxa_pp:+.2f} p.p.), ordenados do maior para o menor ágio/deságio — "
-        "útil para comparar em qual vencimento vale mais a pena comprar se a aposta é ganhar "
-        "com a marcação a mercado."
+        f"Todos os vencimentos de {tipo_titulo_nome} sob o mesmo cenário ({delta_taxa_pp:+.2f} p.p.), "
+        "do maior para o menor ágio/deságio."
     )
     st.dataframe(
         montar_tabela_sensibilidade(titulos, delta_taxa_pp),
@@ -1161,6 +1141,11 @@ def renderizar_marcacao_mercado() -> None:
             "valer mais (ágio). Isso só importa para quem vende antes do vencimento — quem "
             "carrega o título até o final recebe exatamente a taxa que contratou na compra, "
             "independentemente do que aconteceu no meio do caminho."
+        )
+        st.write(
+            "A duration mede essa sensibilidade: como este título não paga cupom, ela é igual "
+            "ao prazo até o vencimento — quanto maior, maior o efeito de qualquer variação na "
+            "taxa sobre o preço. O cálculo considera apenas dias úteis, sem contar feriados."
         )
 
     st.divider()
@@ -1257,10 +1242,10 @@ def renderizar_objetivos_financeiros() -> None:
         )
 
     st.caption(
-        f"Distribuição inicial do aporte: {FATIA_INICIAL_BALDES['curto'] * 100:.0f}% Curto Prazo, "
-        f"{FATIA_INICIAL_BALDES['medio'] * 100:.0f}% Médio Prazo, {FATIA_INICIAL_BALDES['longo'] * 100:.0f}% "
-        "Longo Prazo. Quando um objetivo é atingido, a fatia dele é redirecionada para acelerar os "
-        "objetivos seguintes (efeito cascata)."
+        f"Aporte dividido {FATIA_INICIAL_BALDES['curto'] * 100:.0f}/"
+        f"{FATIA_INICIAL_BALDES['medio'] * 100:.0f}/{FATIA_INICIAL_BALDES['longo'] * 100:.0f}% entre "
+        "curto/médio/longo prazo. Meta atingida → fatia redirecionada para o próximo objetivo "
+        "(efeito cascata)."
     )
 
     col_curto, col_medio, col_longo = st.columns(3)
@@ -1411,21 +1396,14 @@ def renderizar_viver_de_renda() -> None:
         )
     if taxa_real_ipca_pct is not None:
         st.caption(
-            f"Pré-preenchido com a taxa real do Tesouro IPCA+ de prazo mais próximo a "
-            f"{prazo_anos} anos ({taxa_real_ipca_pct:.2f}% a.a.); edite à vontade."
+            f"Pré-preenchido com a taxa real do Tesouro IPCA+ de {prazo_anos} anos "
+            f"({taxa_real_ipca_pct:.2f}% a.a.)."
         )
     else:
-        st.caption(
-            "Não foi possível obter a taxa real de mercado agora; pré-preenchido com 4,00% a.a. "
-            "como premissa padrão."
-        )
+        st.caption("Taxa real de mercado indisponível agora; pré-preenchido com 4,00% a.a.")
 
     taxa_retirada_anual_pct = (
         custo_vida_mensal * 12 / patrimonio_acumulado * 100 if patrimonio_acumulado > 0 else 0.0
-    )
-    st.caption(
-        f"Taxa de retirada anual implícita: {taxa_retirada_anual_pct:.2f}% do patrimônio ao ano "
-        "(referência: a regra dos 4% sugere um teto de retiradas seguras em torno de 4% a.a.)."
     )
 
     df, mes_esgotamento = simular_drawdown(
@@ -1444,11 +1422,18 @@ def renderizar_viver_de_renda() -> None:
             st.metric("Status", f"O dinheiro acaba em: {formatar_anos_meses(mes_esgotamento)}")
     with col_b:
         st.metric("Resgate Mensal Máximo Sustentável", formatar_moeda(resgate_maximo_sustentavel))
-    st.caption(
-        "Resgate mensal máximo sustentável: o valor que poderia ser sacado todo mês mantendo "
-        "o patrimônio estável para sempre (nem cresce, nem encolhe), na rentabilidade real "
-        "informada acima."
-    )
+
+    with st.expander("Entenda a taxa de retirada segura"):
+        st.write(
+            f"Taxa de retirada anual implícita: {taxa_retirada_anual_pct:.2f}% do patrimônio "
+            "ao ano (referência: a regra dos 4% sugere um teto de retiradas seguras em torno "
+            "de 4% a.a.)."
+        )
+        st.write(
+            "Resgate mensal máximo sustentável: o valor que poderia ser sacado todo mês "
+            "mantendo o patrimônio estável para sempre (nem cresce, nem encolhe), na "
+            "rentabilidade real informada acima."
+        )
 
     st.plotly_chart(renderizar_grafico_viver_de_renda(df, sustentavel), use_container_width=True)
 
